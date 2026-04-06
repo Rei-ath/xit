@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import shutil
+import sys
+import time
+from pathlib import Path
+
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.firefox.service import Service
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+
+HOME_URL = "https://x.com/home"
+LOGIN_URL = "https://x.com/i/flow/login"
+COMPOSE_URL = "https://x.com/compose/post"
+LOGIN_TIMEOUT_SECONDS = 600
+POST_TIMEOUT_SECONDS = 60
+TERMUX_X11_DISPLAY = ":0"
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def resolve_profiles_root() -> Path:
+    env_dir = os.environ.get("XIT_PROFILE_DIR", "").strip()
+    if env_dir:
+        root = Path(env_dir).expanduser()
+    else:
+        cwd_root = Path.cwd() / ".xprofiles"
+        root = cwd_root if cwd_root.exists() else Path.home() / ".xprofiles"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    return root
+
+
+def sanitize_profile(profile: str) -> str:
+    safe = "".join(c for c in profile if c.isalnum() or c in ("-", "_", ".")).strip(".")
+    if not safe:
+        raise SystemExit("profile name is empty after sanitization")
+    return safe
+
+
+def profile_root(profile: str) -> Path:
+    return resolve_profiles_root() / sanitize_profile(profile)
+
+
+def profile_browser_path(profile: str) -> Path:
+    return profile_root(profile) / "firefox"
+
+
+def profile_browser_dir(profile: str) -> Path:
+    path = profile_browser_path(profile)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def profile_meta_path(profile: str) -> Path:
+    return profile_root(profile) / "meta.json"
+
+
+def load_meta(profile: str) -> dict | None:
+    path = profile_meta_path(profile)
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_meta(profile: str, payload: dict) -> Path:
+    root = profile_root(profile)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = profile_meta_path(profile)
+    tmp = path.with_suffix(".json.tmp")
+    data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def delete_profile(profile: str) -> None:
+    root = profile_root(profile)
+    if root.exists():
+        shutil.rmtree(root)
+
+
+def rename_profile(old_profile: str, new_profile: str) -> None:
+    old_root = profile_root(old_profile)
+    if not old_root.exists():
+        raise SystemExit(f"profile {old_profile} does not exist")
+
+    new_root = profile_root(new_profile)
+    if new_root.exists():
+        raise SystemExit(f"profile {new_profile} already exists")
+
+    old_root.rename(new_root)
+
+    meta = load_meta(new_profile)
+    if meta is not None:
+        meta["profile"] = sanitize_profile(new_profile)
+        meta["browser_dir"] = str(profile_browser_path(new_profile))
+        meta["updated_at"] = now()
+        save_meta(new_profile, meta)
+
+
+def firefox_binary() -> str:
+    env = os.environ.get("XIT_FIREFOX_BINARY", "").strip()
+    if env:
+        return env
+    for candidate in ("firefox", "firefox-esr", "fennec"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    raise SystemExit(
+        "could not find a Firefox binary. Set XIT_FIREFOX_BINARY to the browser path."
+    )
+
+
+def geckodriver_binary() -> str:
+    env = os.environ.get("XIT_GECKODRIVER", "").strip()
+    if env:
+        return env
+    found = shutil.which("geckodriver")
+    if found:
+        return found
+    raise SystemExit("could not find geckodriver. Set XIT_GECKODRIVER to the driver path.")
+
+
+def ensure_display() -> None:
+    if os.environ.get("DISPLAY", "").strip():
+        return
+
+    termux_x11 = shutil.which("termux-x11")
+    if not termux_x11:
+        raise SystemExit(
+            "no DISPLAY is set and termux-x11 is not installed.\n"
+            "Start an X11 session and export DISPLAY=:0 before running xit."
+        )
+
+    try:
+        subprocess.run(
+            ["am", "start", "-n", "com.termux.x11/com.termux.x11.MainActivity"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+    try:
+        subprocess.Popen(
+            [termux_x11, TERMUX_X11_DISPLAY],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise SystemExit(
+            "failed to start termux-x11 automatically. "
+            "Start Termux:X11 manually and export DISPLAY=:0.\n"
+            f"{exc}"
+        ) from exc
+
+    os.environ["DISPLAY"] = TERMUX_X11_DISPLAY
+    time.sleep(2)
+
+
+def launch_manual_firefox(profile: str, url: str):
+    ensure_display()
+    cmd = [
+        firefox_binary(),
+        "--new-instance",
+        "--profile",
+        str(profile_browser_dir(profile)),
+        url,
+    ]
+    try:
+        return subprocess.Popen(cmd)
+    except OSError as exc:
+        raise SystemExit(f"failed to launch Firefox for manual login: {exc}") from exc
+
+
+def build_driver(profile: str, headless: bool = False) -> webdriver.Firefox:
+    if not headless:
+        ensure_display()
+    options = Options()
+    options.binary_location = firefox_binary()
+    options.add_argument("-profile")
+    options.add_argument(str(profile_browser_dir(profile)))
+    options.add_argument("--new-instance")
+    if headless:
+        options.add_argument("-headless")
+    options.set_preference("dom.webnotifications.enabled", False)
+    options.set_preference("browser.startup.homepage", "about:blank")
+    options.set_preference("browser.shell.checkDefaultBrowser", False)
+    options.set_preference("browser.aboutConfig.showWarning", False)
+    options.set_preference("toolkit.telemetry.reportingpolicy.firstRun", False)
+    service = Service(geckodriver_binary())
+    try:
+        driver = webdriver.Firefox(service=service, options=options)
+        driver.set_window_size(1280, 960)
+        return driver
+    except WebDriverException as exc:
+        raise SystemExit(
+            "failed to launch Firefox via Selenium. "
+            "Check that Firefox and geckodriver are installed and compatible.\n"
+            f"{exc}"
+        ) from exc
+
+
+def has_css(driver: webdriver.Firefox, selector: str) -> bool:
+    return bool(driver.execute_script("return !!document.querySelector(arguments[0]);", selector))
+
+
+def is_logged_in(driver: webdriver.Firefox) -> bool:
+    selectors = (
+        "[data-testid='AppTabBar_Home_Link']",
+        "[data-testid='SideNav_NewTweet_Button']",
+        "[data-testid='SideNav_NewTweet_Button_Button']",
+        "[data-testid='tweetTextarea_0']",
+        "a[href='/compose/post']",
+    )
+    for selector in selectors:
+        try:
+            if has_css(driver, selector):
+                return True
+        except WebDriverException:
+            continue
+    current = driver.current_url
+    return "/home" in current and "/i/flow/login" not in current
+
+
+def wait_for_login(
+    driver: webdriver.Firefox,
+    profile: str,
+    timeout_seconds: int,
+    allow_manual_login: bool,
+) -> None:
+    driver.get(HOME_URL)
+    if is_logged_in(driver):
+        return
+
+    if not allow_manual_login:
+        raise SystemExit(
+            f"no logged-in session found for {profile}.\n"
+            f"Run `xit auth {profile}` in visible mode first."
+        )
+
+    driver.get(LOGIN_URL)
+    print("complete the login in the opened browser window")
+    print("the session will be cached under:", profile_browser_path(profile))
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            if is_logged_in(driver):
+                return
+        except WebDriverException:
+            pass
+        time.sleep(2)
+    raise SystemExit(
+        f"timed out waiting for X login after {timeout_seconds} seconds. "
+        "Re-run the command and complete login in the browser."
+    )
+
+
+def wait_clickable(driver: webdriver.Firefox, selectors: list[str], timeout_seconds: int):
+    deadline = time.time() + timeout_seconds
+    last_error = None
+    while time.time() < deadline:
+        for selector in selectors:
+            try:
+                element = WebDriverWait(driver, 1).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                )
+                return element
+            except TimeoutException as exc:
+                last_error = exc
+        time.sleep(1)
+    raise SystemExit(f"could not find a clickable element for selectors: {selectors}\n{last_error}")
+
+
+def update_meta(profile: str, action: str) -> None:
+    meta = load_meta(profile) or {"profile": sanitize_profile(profile)}
+    meta["browser_dir"] = str(profile_browser_dir(profile))
+    meta["last_action"] = action
+    meta["updated_at"] = now()
+    save_meta(profile, meta)
+
+
+def keep_window_open(driver: webdriver.Firefox) -> None:
+    print("browser is still open. Press Enter here to close it.")
+    try:
+        input()
+    except EOFError:
+        time.sleep(30)
+
+
+def ensure_session(profile: str, keep_open: bool, headless: bool) -> None:
+    if headless:
+        raise SystemExit("headless auth is not supported. Run `xit auth <profile>` without --headless.")
+    print("opening normal Firefox for login")
+    print("log in there, then close Firefox and press Enter here")
+    proc = launch_manual_firefox(profile, LOGIN_URL)
+    try:
+        input()
+    except EOFError:
+        pass
+
+    if proc.poll() is None:
+        print("Firefox is still running. Close it so the profile lock is released, then press Enter.")
+        try:
+            input()
+        except EOFError:
+            pass
+
+    driver = build_driver(profile, headless=False)
+    try:
+        wait_for_login(driver, profile, 20, allow_manual_login=False)
+        update_meta(profile, "auth")
+        print(f"session ready for {profile}")
+        print(f"profile cache: {profile_root(profile)}")
+        if keep_open:
+            keep_window_open(driver)
+    finally:
+        driver.quit()
+
+
+def post_text(profile: str, text: str, keep_open: bool, headless: bool) -> None:
+    if headless and keep_open:
+        print("ignoring --keep-open in headless mode")
+        keep_open = False
+    driver = build_driver(profile, headless=headless)
+    try:
+        wait_for_login(driver, profile, LOGIN_TIMEOUT_SECONDS, allow_manual_login=not headless)
+        driver.get(COMPOSE_URL)
+        textbox = wait_clickable(
+            driver,
+            [
+                "[data-testid='tweetTextarea_0']",
+                "div[role='textbox'][data-testid='tweetTextarea_0']",
+                "div[role='textbox']",
+            ],
+            POST_TIMEOUT_SECONDS,
+        )
+        textbox.click()
+        driver.execute_script("arguments[0].textContent = '';", textbox)
+        textbox.send_keys(text)
+
+        post_button = wait_clickable(
+            driver,
+            [
+                "[data-testid='tweetButton']",
+                "[data-testid='tweetButtonInline']",
+            ],
+            POST_TIMEOUT_SECONDS,
+        )
+        post_button.click()
+
+        time.sleep(3)
+        update_meta(profile, "post")
+        print(f"posted as {profile}")
+        if keep_open:
+            keep_window_open(driver)
+    finally:
+        driver.quit()
+
+
+def show_profile(profile: str) -> None:
+    meta = load_meta(profile) or {}
+    root = profile_root(profile)
+    browser = profile_browser_path(profile)
+    summary = {
+        "profile": sanitize_profile(profile),
+        "profile_root": str(root),
+        "browser_dir": str(browser),
+        "has_cached_session": browser.exists(),
+        "has_cached_meta": bool(meta),
+        "last_action": meta.get("last_action"),
+        "updated_at": meta.get("updated_at"),
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+
+
+def list_profiles() -> None:
+    root = resolve_profiles_root()
+    found = sorted([p.name for p in root.iterdir() if p.is_dir()])
+    if not found:
+        print("no cached profiles")
+        return
+    for item in found:
+        print(item)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="xit",
+        description="Use a persistent Firefox profile per X account and post through the web UI.",
+    )
+    parser.add_argument("profile", nargs="?", help="profile label, usually the X username")
+    parser.add_argument("--post", dest="post_text_value", help="publish a post through the X web UI")
+    parser.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="leave the browser open after auth/post",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="reuse a cached session in headless Firefox; not supported for auth",
+    )
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == "list":
+        list_profiles()
+        return 0
+
+    if argv and argv[0] == "logout":
+        parser = argparse.ArgumentParser(prog="xit logout", description="remove a cached browser profile")
+        parser.add_argument("profile")
+        args = parser.parse_args(argv[1:])
+        delete_profile(args.profile)
+        print(f"removed cached profile for {args.profile}")
+        return 0
+
+    if argv and argv[0] == "nickname":
+        parser = argparse.ArgumentParser(prog="xit nickname", description="rename a cached browser profile")
+        parser.add_argument("old_profile")
+        parser.add_argument("new_profile")
+        args = parser.parse_args(argv[1:])
+        rename_profile(args.old_profile, args.new_profile)
+        print(f"renamed cached profile {args.old_profile} -> {args.new_profile}")
+        return 0
+
+    if argv and argv[0] == "auth":
+        parser = argparse.ArgumentParser(prog="xit auth", description="open X login and cache the browser session")
+        parser.add_argument("profile")
+        parser.add_argument("--keep-open", action="store_true")
+        parser.add_argument("--headless", action="store_true")
+        args = parser.parse_args(argv[1:])
+        ensure_session(args.profile, keep_open=args.keep_open, headless=args.headless)
+        return 0
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.profile:
+        parser.print_help(sys.stderr)
+        return 2
+
+    if args.post_text_value:
+        post_text(args.profile, args.post_text_value, keep_open=args.keep_open, headless=args.headless)
+        return 0
+
+    show_profile(args.profile)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

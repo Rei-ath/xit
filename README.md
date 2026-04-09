@@ -1,8 +1,8 @@
 # xit
 
-`xit` posts to X through the Firefox web UI using a persistent browser profile per account.
+`xit` posts to X through the Firefox web UI using a reusable profile per account.
 
-This repo targets Termux and Firefox/geckodriver. Login is done in a normal visible Firefox window, then later posts can reuse that saved session in visible or headless mode.
+Auth now defaults to a localhost capture flow: `xit` starts a small local web page, you paste session data from a logged-in `x.com` browser tab, and `xit` verifies and stores that session for later reuse. This avoids the old hard dependency on a visible Firefox/X11 login window.
 
 ## Requirements
 
@@ -10,7 +10,10 @@ This repo targets Termux and Firefox/geckodriver. Login is done in a normal visi
 - Firefox
 - `geckodriver`
 - `selenium`
-- Termux:X11 for visible login on Android/Termux
+
+Optional:
+
+- Termux:X11 only if you still want the old visible browser auth flow or visible posting without an existing `DISPLAY`
 
 Install Python dependency:
 
@@ -20,22 +23,41 @@ pip install -r requirements.txt
 
 ## Usage
 
-First login:
+Capture a session locally:
 
 ```bash
 ./xit auth your_username
 ```
 
-After that, post visibly:
+That prints a local URL such as `http://127.0.0.1:8765/`. Open it in any browser, then paste one of these from a logged-in `https://x.com` tab:
+
+- a Network request copied as curl
+- a raw `Cookie:` header
+- a cookie JSON export
+- a Netscape cookie file
+
+After that, post headlessly:
+
+```bash
+./xit your_username --post "hello" --headless
+```
+
+Or post visibly if you have a working GUI/display:
 
 ```bash
 ./xit your_username --post "hello"
 ```
 
-Or reuse the cached session headlessly:
+Expose the auth page on another interface or device:
 
 ```bash
-./xit your_username --post "hello" --headless
+./xit auth your_username --bind 0.0.0.0 --port 8765
+```
+
+Use the old visible browser login flow explicitly:
+
+```bash
+./xit auth your_username --manual-browser
 ```
 
 Inspect cached profile status:
@@ -59,7 +81,8 @@ Rename a cached profile:
 
 ## Notes
 
-- Cached Firefox session data is stored under `.xprofiles/<profile>/firefox`.
-- Headless mode only works after a visible login has already been cached.
-- If `DISPLAY` is missing, `xit` tries to start Termux:X11 automatically.
-- Sites can still invalidate sessions or change UI selectors; this tool depends on the current X web app structure.
+- Cached Firefox data lives under `.xprofiles/<profile>/firefox`.
+- Imported session metadata is stored in `.xprofiles/<profile>/meta.json`.
+- Headless posting no longer requires a previous GUI login if you captured a valid session through `xit auth`.
+- If a stored session expires, run `./xit auth <profile>` again and paste fresh session data.
+- UI selectors and session behavior on X can still change and break automation.

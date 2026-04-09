@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 import argparse
+import html
 import json
 import os
-import subprocess
+import shlex
 import shutil
+import subprocess
 import sys
 import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -17,12 +22,19 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 
+ROOT_URL = "https://x.com/"
 HOME_URL = "https://x.com/home"
 LOGIN_URL = "https://x.com/i/flow/login"
 COMPOSE_URL = "https://x.com/compose/post"
 LOGIN_TIMEOUT_SECONDS = 600
+LOGIN_PROBE_SECONDS = 10
 POST_TIMEOUT_SECONDS = 60
+AUTH_CAPTURE_TIMEOUT_SECONDS = 900
+AUTH_CAPTURE_HOST = "127.0.0.1"
+AUTH_CAPTURE_PORT = 8765
+SESSION_COOKIE_NAMES = {"auth_token", "ct0"}
 TERMUX_X11_DISPLAY = ":0"
+X_DOMAINS = ("x.com", "twitter.com")
 
 
 def now() -> int:
@@ -245,33 +257,722 @@ def is_logged_in(driver: webdriver.Firefox) -> bool:
     return "/home" in current and "/i/flow/login" not in current
 
 
+def wait_until_logged_in(driver: webdriver.Firefox, timeout_seconds: int) -> bool:
+    deadline = time.time() + max(timeout_seconds, 1)
+    while True:
+        try:
+            if is_logged_in(driver):
+                return True
+        except WebDriverException:
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(2)
+
+
+def cookie_names(cookies: list[dict]) -> set[str]:
+    return {str(cookie.get("name", "")).strip() for cookie in cookies}
+
+
+def is_x_domain(domain: str) -> bool:
+    clean = domain.strip().lstrip("#").lstrip(".").lower()
+    if clean.startswith("httponly_"):
+        clean = clean[len("httponly_") :]
+    return any(clean.endswith(item) for item in X_DOMAINS)
+
+
+def normalize_same_site(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    lowered = str(value).strip().lower().replace("-", "_")
+    mapping = {
+        "none": "None",
+        "no_restriction": "None",
+        "lax": "Lax",
+        "strict": "Strict",
+        "unspecified": None,
+    }
+    if lowered not in mapping:
+        return None
+    return mapping[lowered]
+
+
+def stringify_storage_value(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def normalize_local_storage_payload(data: object) -> dict[str, str]:
+    if isinstance(data, dict):
+        if "origins" in data:
+            return extract_local_storage_from_origins(data["origins"])
+        if "localStorage" in data:
+            return normalize_local_storage_payload(data["localStorage"])
+        if "name" in data and "value" in data:
+            return {str(data["name"]): stringify_storage_value(data["value"])}
+        return {str(key): stringify_storage_value(value) for key, value in data.items()}
+
+    if isinstance(data, list):
+        storage = {}
+        for item in data:
+            if not isinstance(item, dict) or "name" not in item or "value" not in item:
+                raise ValueError("local storage entries must be objects with name and value")
+            storage[str(item["name"])] = stringify_storage_value(item["value"])
+        return storage
+
+    raise ValueError("local storage must be a JSON object or list")
+
+
+def extract_local_storage_from_origins(origins: object) -> dict[str, str]:
+    if not isinstance(origins, list):
+        raise ValueError("origins must be a JSON list")
+    storage: dict[str, str] = {}
+    for origin in origins:
+        if not isinstance(origin, dict):
+            continue
+        origin_name = str(origin.get("origin", "")).rstrip("/")
+        if origin_name not in ("https://x.com", "https://twitter.com"):
+            continue
+        items = origin.get("localStorage", [])
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or "name" not in item or "value" not in item:
+                continue
+            storage[str(item["name"])] = stringify_storage_value(item["value"])
+    return storage
+
+
+def normalize_cookie(cookie: dict, default_domain: str = "x.com") -> dict:
+    name = str(cookie.get("name", "")).strip()
+    if not name:
+        raise ValueError("cookie is missing a name")
+
+    value = str(cookie.get("value", ""))
+    domain_value = str(cookie.get("domain", "")).strip()
+    domain = domain_value.lstrip("#").lstrip(".")
+    if domain.lower().startswith("httponly_"):
+        domain = domain[len("httponly_") :]
+    if not domain:
+        domain = default_domain
+    elif is_x_domain(domain):
+        domain = "x.com"
+
+    normalized = {
+        "name": name,
+        "value": value,
+        "domain": domain,
+        "path": str(cookie.get("path", "/") or "/"),
+        "secure": bool(cookie.get("secure", True)),
+    }
+
+    http_only = cookie.get("httpOnly", cookie.get("http_only"))
+    if http_only is not None:
+        normalized["httpOnly"] = bool(http_only)
+
+    expiry = cookie.get("expiry", cookie.get("expires", cookie.get("expirationDate")))
+    if expiry not in (None, "", 0, "0"):
+        try:
+            normalized["expiry"] = int(float(str(expiry)))
+        except ValueError:
+            pass
+
+    same_site = normalize_same_site(cookie.get("sameSite", cookie.get("same_site")))
+    if same_site:
+        normalized["sameSite"] = same_site
+
+    return normalized
+
+
+def parse_cookie_pairs(raw: str) -> list[dict]:
+    header = raw.strip()
+    if not header:
+        return []
+    if header.lower().startswith("cookie:"):
+        header = header.split(":", 1)[1].strip()
+    cookies = []
+    for chunk in header.split(";"):
+        piece = chunk.strip()
+        if not piece or "=" not in piece:
+            continue
+        name, value = piece.split("=", 1)
+        cookies.append(
+            normalize_cookie(
+                {
+                    "name": name.strip(),
+                    "value": value.strip(),
+                    "domain": "x.com",
+                    "path": "/",
+                    "secure": True,
+                }
+            )
+        )
+    return cookies
+
+
+def parse_curl_command(raw: str) -> dict:
+    try:
+        tokens = shlex.split(raw, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"could not parse the pasted curl command: {exc}") from exc
+
+    if not tokens or Path(tokens[0]).name != "curl":
+        raise ValueError("not a curl command")
+
+    headers: dict[str, str] = {}
+    cookie_override = ""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        next_value = tokens[index + 1] if index + 1 < len(tokens) else None
+
+        if token in ("-H", "--header") and next_value is not None:
+            header = next_value
+            index += 2
+        elif token.startswith("--header="):
+            header = token.split("=", 1)[1]
+            index += 1
+        elif token.startswith("-H") and token != "-H":
+            header = token[2:]
+            index += 1
+        elif token in ("-b", "--cookie") and next_value is not None:
+            cookie_override = next_value
+            index += 2
+            continue
+        elif token.startswith("--cookie="):
+            cookie_override = token.split("=", 1)[1]
+            index += 1
+            continue
+        else:
+            index += 1
+            continue
+
+        name, sep, value = header.partition(":")
+        if sep:
+            headers[name.strip().lower()] = value.strip()
+
+    cookie_header = cookie_override or headers.get("cookie", "")
+    cookies = parse_cookie_pairs(cookie_header)
+    if not cookies:
+        raise ValueError("the pasted curl command does not include a Cookie header")
+
+    csrf = headers.get("x-csrf-token", "").strip()
+    if csrf and "ct0" not in cookie_names(cookies):
+        cookies.append(
+            normalize_cookie(
+                {
+                    "name": "ct0",
+                    "value": csrf,
+                    "domain": "x.com",
+                    "path": "/",
+                    "secure": True,
+                }
+            )
+        )
+
+    return {
+        "cookies": cookies,
+        "local_storage": {},
+        "source": "curl",
+        "user_agent": headers.get("user-agent"),
+    }
+
+
+def parse_netscape_cookie_file(raw: str) -> dict:
+    cookies = []
+    for line in raw.splitlines():
+        entry = line.strip()
+        if not entry:
+            continue
+
+        http_only = False
+        if entry.startswith("#HttpOnly_"):
+            http_only = True
+            entry = entry[len("#HttpOnly_") :]
+        elif entry.startswith("#"):
+            continue
+
+        parts = entry.split("\t")
+        if len(parts) != 7:
+            continue
+
+        domain, _, path, secure, expiry, name, value = parts
+        if not is_x_domain(domain):
+            continue
+        cookie = normalize_cookie(
+            {
+                "domain": domain,
+                "path": path,
+                "secure": secure.upper() == "TRUE",
+                "expiry": expiry,
+                "name": name,
+                "value": value,
+                "httpOnly": http_only,
+            }
+        )
+        cookies.append(cookie)
+
+    if not cookies:
+        raise ValueError("not a Netscape cookie file")
+
+    return {"cookies": cookies, "local_storage": {}, "source": "netscape"}
+
+
+def parse_json_session_payload(raw: str) -> dict:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("not JSON session data") from exc
+
+    local_storage: dict[str, str] = {}
+    cookies_source: object
+
+    if isinstance(data, list):
+        cookies_source = data
+    elif isinstance(data, dict):
+        if "session" in data and isinstance(data["session"], dict):
+            nested = data["session"]
+            cookies_source = nested.get("cookies", [])
+            local_storage.update(
+                normalize_local_storage_payload(nested.get("local_storage", {}))
+                if nested.get("local_storage")
+                else {}
+            )
+        elif "cookies" in data:
+            cookies_source = data["cookies"]
+        elif "name" in data and "value" in data:
+            cookies_source = [data]
+        else:
+            raise ValueError("JSON payload does not contain cookies")
+
+        if "origins" in data:
+            local_storage.update(extract_local_storage_from_origins(data["origins"]))
+        if "local_storage" in data and data["local_storage"]:
+            local_storage.update(normalize_local_storage_payload(data["local_storage"]))
+        if "localStorage" in data and data["localStorage"]:
+            local_storage.update(normalize_local_storage_payload(data["localStorage"]))
+    else:
+        raise ValueError("JSON payload must be an object or list")
+
+    if not isinstance(cookies_source, list):
+        raise ValueError("cookies must be a JSON list")
+
+    cookies = []
+    for item in cookies_source:
+        if not isinstance(item, dict):
+            continue
+        domain = str(item.get("domain", "")).strip()
+        if domain and not is_x_domain(domain):
+            continue
+        cookies.append(normalize_cookie(item))
+
+    if not cookies:
+        raise ValueError("JSON payload does not contain any X cookies")
+
+    return {"cookies": cookies, "local_storage": local_storage, "source": "json"}
+
+
+def parse_cookie_header_payload(raw: str) -> dict:
+    cookie_line = ""
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    for line in lines:
+        if line.lower().startswith("cookie:"):
+            cookie_line = line
+            break
+    cookies = parse_cookie_pairs(cookie_line or raw)
+    if not cookies:
+        raise ValueError("not a cookie header")
+    return {"cookies": cookies, "local_storage": {}, "source": "cookie-header"}
+
+
+def parse_local_storage_json(raw: str) -> dict[str, str]:
+    text = raw.strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"local storage must be valid JSON: {exc}") from exc
+    return normalize_local_storage_payload(data)
+
+
+def parse_session_capture(raw_session: str, raw_local_storage: str) -> dict:
+    session_text = raw_session.strip()
+    if not session_text:
+        raise ValueError("paste a curl command, Cookie header, JSON export, or Netscape cookie file")
+
+    parsers = (
+        parse_curl_command,
+        parse_json_session_payload,
+        parse_netscape_cookie_file,
+        parse_cookie_header_payload,
+    )
+    last_error: ValueError | None = None
+    capture = None
+    for parser in parsers:
+        try:
+            capture = parser(session_text)
+            break
+        except ValueError as exc:
+            last_error = exc
+
+    if capture is None:
+        message = str(last_error) if last_error else "could not parse the submitted session data"
+        raise ValueError(message)
+
+    capture["local_storage"] = {
+        **capture.get("local_storage", {}),
+        **parse_local_storage_json(raw_local_storage),
+    }
+    capture["captured_at"] = now()
+
+    names = cookie_names(capture["cookies"])
+    missing = sorted(SESSION_COOKIE_NAMES - names)
+    if missing:
+        raise ValueError(
+            "missing required X cookies: "
+            + ", ".join(missing)
+            + ". Capture from a logged-in https://x.com request."
+        )
+    return capture
+
+
+def build_capture_page(
+    profile: str,
+    session_text: str,
+    storage_text: str,
+    error: str = "",
+    success: dict | None = None,
+) -> str:
+    title = f"xit auth: {profile}"
+    error_html = ""
+    if error:
+        error_html = (
+            "<p style='background:#fee2e2;border:1px solid #ef4444;padding:12px;"
+            "border-radius:10px;color:#7f1d1d;'>"
+            f"{html.escape(error)}</p>"
+        )
+
+    success_html = ""
+    if success is not None:
+        names = ", ".join(sorted(cookie_names(success.get("cookies", []))))
+        success_html = (
+            "<p style='background:#dcfce7;border:1px solid #22c55e;padding:12px;"
+            "border-radius:10px;color:#14532d;'>"
+            "Session captured. Return to the terminal; verification is running there."
+            "</p>"
+            f"<p><strong>Cookies:</strong> {html.escape(names)}</p>"
+        )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f8fafc;
+      --fg: #0f172a;
+      --muted: #475569;
+      --line: #cbd5e1;
+      --card: #ffffff;
+      --accent: #0f172a;
+    }}
+    body {{
+      margin: 0;
+      font: 16px/1.5 sans-serif;
+      background: linear-gradient(180deg, #e2e8f0 0%, var(--bg) 180px);
+      color: var(--fg);
+    }}
+    main {{
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 24px;
+    }}
+    .card {{
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
+    }}
+    h1 {{
+      margin-top: 0;
+      font-size: 28px;
+    }}
+    p, li {{
+      color: var(--muted);
+    }}
+    textarea {{
+      width: 100%;
+      min-height: 220px;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      font: 14px/1.4 monospace;
+      box-sizing: border-box;
+      resize: vertical;
+    }}
+    label {{
+      display: block;
+      margin: 18px 0 8px;
+      font-weight: 700;
+      color: var(--fg);
+    }}
+    button {{
+      margin-top: 18px;
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 999px;
+      padding: 12px 18px;
+      font: inherit;
+      cursor: pointer;
+    }}
+    code {{
+      background: #e2e8f0;
+      padding: 1px 5px;
+      border-radius: 6px;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="card">
+      <h1>{html.escape(title)}</h1>
+      <p>Paste a logged-in X session for <code>{html.escape(profile)}</code>.</p>
+      <ol>
+        <li>Open <code>https://x.com</code> in any browser where you are already logged in.</li>
+        <li>Copy one of these: a Network request as curl, a raw <code>Cookie:</code> header, a cookie JSON export, or a Netscape cookie file.</li>
+        <li>Paste it here and submit.</li>
+      </ol>
+      <p>An optional local storage JSON export can be pasted separately if you have one.</p>
+      {error_html}
+      {success_html}
+      <form method="post" action="/capture">
+        <label for="session_payload">Session payload</label>
+        <textarea id="session_payload" name="session_payload" spellcheck="false">{html.escape(session_text)}</textarea>
+        <label for="local_storage">Local storage JSON (optional)</label>
+        <textarea id="local_storage" name="local_storage" spellcheck="false">{html.escape(storage_text)}</textarea>
+        <button type="submit">Capture session</button>
+      </form>
+    </div>
+  </main>
+</body>
+</html>
+"""
+
+
+def capture_session_via_localhost(profile: str, host: str, port: int, timeout_seconds: int) -> dict:
+    state = {
+        "capture": None,
+        "error": "",
+        "session_text": "",
+        "storage_text": "",
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path != "/":
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.respond(
+                build_capture_page(
+                    profile,
+                    state["session_text"],
+                    state["storage_text"],
+                    error=state["error"],
+                )
+            )
+
+        def do_POST(self) -> None:
+            if self.path != "/capture":
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = self.rfile.read(length).decode("utf-8", errors="replace")
+            form = parse_qs(payload, keep_blank_values=True)
+            state["session_text"] = form.get("session_payload", [""])[0]
+            state["storage_text"] = form.get("local_storage", [""])[0]
+
+            try:
+                state["capture"] = parse_session_capture(
+                    state["session_text"],
+                    state["storage_text"],
+                )
+            except ValueError as exc:
+                state["error"] = str(exc)
+                self.respond(
+                    build_capture_page(
+                        profile,
+                        state["session_text"],
+                        state["storage_text"],
+                        error=state["error"],
+                    ),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+
+            state["error"] = ""
+            self.respond(
+                build_capture_page(
+                    profile,
+                    "",
+                    "",
+                    success=state["capture"],
+                )
+            )
+
+        def log_message(self, format: str, *args) -> None:
+            return
+
+        def respond(self, body: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+            payload = body.encode("utf-8")
+            self.send_response(int(status))
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    try:
+        server = HTTPServer((host, port), Handler)
+    except OSError as exc:
+        raise SystemExit(f"failed to start the local auth server on {host}:{port}: {exc}") from exc
+
+    server.timeout = 1
+    actual_host, actual_port = server.server_address[:2]
+    display_host = "127.0.0.1" if actual_host == "0.0.0.0" else actual_host
+
+    print(f"localhost auth capture for {profile}", flush=True)
+    print(f"open this URL in a browser: http://{display_host}:{actual_port}/", flush=True)
+    if actual_host == "0.0.0.0":
+        print(
+            "replace 127.0.0.1 with this machine's LAN IP if you are opening it from another device",
+            flush=True,
+        )
+    print(
+        "paste a logged-in X request as curl, a Cookie header, or an exported cookie file",
+        flush=True,
+    )
+    print("press Ctrl+C here to cancel", flush=True)
+
+    deadline = time.time() + max(timeout_seconds, 1)
+    try:
+        while time.time() < deadline and state["capture"] is None:
+            server.handle_request()
+    except KeyboardInterrupt as exc:
+        raise SystemExit("auth capture cancelled") from exc
+    finally:
+        server.server_close()
+
+    if state["capture"] is not None:
+        return state["capture"]
+    raise SystemExit(
+        f"timed out waiting for localhost auth capture after {timeout_seconds} seconds. "
+        "Re-run the command and submit the session data before the timeout."
+    )
+
+
+def load_stored_session(profile: str) -> dict | None:
+    meta = load_meta(profile) or {}
+    session = meta.get("session")
+    if not isinstance(session, dict):
+        return None
+    cookies = session.get("cookies")
+    if not isinstance(cookies, list) or not cookies:
+        return None
+    return session
+
+
+def restore_session(driver: webdriver.Firefox, session: dict) -> bool:
+    cookies = session.get("cookies", [])
+    local_storage = session.get("local_storage", {})
+    if not cookies and not local_storage:
+        return False
+
+    driver.get(ROOT_URL)
+    try:
+        driver.delete_all_cookies()
+    except WebDriverException:
+        pass
+
+    for cookie in cookies:
+        driver_cookie = {
+            "name": cookie["name"],
+            "value": cookie["value"],
+            "path": cookie.get("path", "/"),
+            "secure": bool(cookie.get("secure", True)),
+        }
+        if cookie.get("domain"):
+            driver_cookie["domain"] = str(cookie["domain"]).lstrip(".")
+        if "httpOnly" in cookie:
+            driver_cookie["httpOnly"] = bool(cookie["httpOnly"])
+        if cookie.get("expiry"):
+            driver_cookie["expiry"] = int(cookie["expiry"])
+        if cookie.get("sameSite"):
+            driver_cookie["sameSite"] = cookie["sameSite"]
+
+        try:
+            driver.add_cookie(driver_cookie)
+        except WebDriverException:
+            fallback_cookie = dict(driver_cookie)
+            fallback_cookie.pop("domain", None)
+            try:
+                driver.add_cookie(fallback_cookie)
+            except WebDriverException as exc:
+                raise SystemExit(
+                    f"failed to restore stored cookie {driver_cookie['name']}: {exc}"
+                ) from exc
+
+    if isinstance(local_storage, dict) and local_storage:
+        driver.execute_script(
+            """
+            for (const [key, value] of Object.entries(arguments[0])) {
+              window.localStorage.setItem(key, value);
+            }
+            """,
+            local_storage,
+        )
+
+    driver.get(HOME_URL)
+    return True
+
+
 def wait_for_login(
     driver: webdriver.Firefox,
     profile: str,
     timeout_seconds: int,
     allow_manual_login: bool,
+    session_payload: dict | None = None,
 ) -> None:
+    probe_seconds = min(timeout_seconds, LOGIN_PROBE_SECONDS)
+
     driver.get(HOME_URL)
-    if is_logged_in(driver):
+    if wait_until_logged_in(driver, probe_seconds):
         return
+
+    active_session = session_payload or load_stored_session(profile)
+    if active_session:
+        restore_session(driver, active_session)
+        if wait_until_logged_in(driver, probe_seconds):
+            return
 
     if not allow_manual_login:
         raise SystemExit(
             f"no logged-in session found for {profile}.\n"
-            f"Run `xit auth {profile}` in visible mode first."
+            f"Run `xit auth {profile}` to capture a session via localhost or "
+            f"`xit auth {profile} --manual-browser` for the old visible-browser flow."
         )
 
     driver.get(LOGIN_URL)
-    print("complete the login in the opened browser window")
-    print("the session will be cached under:", profile_browser_path(profile))
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        try:
-            if is_logged_in(driver):
-                return
-        except WebDriverException:
-            pass
-        time.sleep(2)
+    print("complete the login in the opened browser window", flush=True)
+    print("the session will be cached under:", profile_browser_path(profile), flush=True)
+    if wait_until_logged_in(driver, timeout_seconds):
+        return
     raise SystemExit(
         f"timed out waiting for X login after {timeout_seconds} seconds. "
         "Re-run the command and complete login in the browser."
@@ -294,27 +995,29 @@ def wait_clickable(driver: webdriver.Firefox, selectors: list[str], timeout_seco
     raise SystemExit(f"could not find a clickable element for selectors: {selectors}\n{last_error}")
 
 
-def update_meta(profile: str, action: str) -> None:
+def update_meta(profile: str, action: str, session: dict | None = None) -> None:
     meta = load_meta(profile) or {"profile": sanitize_profile(profile)}
     meta["browser_dir"] = str(profile_browser_dir(profile))
     meta["last_action"] = action
     meta["updated_at"] = now()
+    if session is not None:
+        meta["session"] = session
     save_meta(profile, meta)
 
 
 def keep_window_open(driver: webdriver.Firefox) -> None:
-    print("browser is still open. Press Enter here to close it.")
+    print("browser is still open. Press Enter here to close it.", flush=True)
     try:
         input()
     except EOFError:
         time.sleep(30)
 
 
-def ensure_session(profile: str, keep_open: bool, headless: bool) -> None:
+def ensure_session_via_browser(profile: str, keep_open: bool, headless: bool) -> None:
     if headless:
         raise SystemExit("headless auth is not supported. Run `xit auth <profile>` without --headless.")
-    print("opening normal Firefox for login")
-    print("log in there, then close Firefox and press Enter here")
+    print("opening normal Firefox for login", flush=True)
+    print("log in there, then close Firefox and press Enter here", flush=True)
     proc = launch_manual_firefox(profile, LOGIN_URL)
     try:
         input()
@@ -322,7 +1025,10 @@ def ensure_session(profile: str, keep_open: bool, headless: bool) -> None:
         pass
 
     if proc.poll() is None:
-        print("Firefox is still running. Close it so the profile lock is released, then press Enter.")
+        print(
+            "Firefox is still running. Close it so the profile lock is released, then press Enter.",
+            flush=True,
+        )
         try:
             input()
         except EOFError:
@@ -340,13 +1046,55 @@ def ensure_session(profile: str, keep_open: bool, headless: bool) -> None:
         driver.quit()
 
 
+def ensure_session(
+    profile: str,
+    keep_open: bool,
+    headless: bool,
+    manual_browser: bool,
+    auth_bind: str,
+    auth_port: int,
+    auth_timeout: int,
+) -> None:
+    if manual_browser:
+        ensure_session_via_browser(profile, keep_open=keep_open, headless=headless)
+        return
+
+    if keep_open:
+        print("ignoring --keep-open for localhost auth capture", flush=True)
+    if headless:
+        print("`--headless` is implied for localhost auth capture", flush=True)
+
+    capture = capture_session_via_localhost(
+        profile,
+        host=auth_bind,
+        port=auth_port,
+        timeout_seconds=auth_timeout,
+    )
+
+    print("verifying the captured session in headless Firefox", flush=True)
+    driver = build_driver(profile, headless=True)
+    try:
+        wait_for_login(driver, profile, 20, allow_manual_login=False, session_payload=capture)
+    finally:
+        driver.quit()
+
+    update_meta(profile, "auth", session=capture)
+    print(f"session ready for {profile}")
+    print(f"profile cache: {profile_root(profile)}")
+
+
 def post_text(profile: str, text: str, keep_open: bool, headless: bool) -> None:
     if headless and keep_open:
         print("ignoring --keep-open in headless mode")
         keep_open = False
     driver = build_driver(profile, headless=headless)
     try:
-        wait_for_login(driver, profile, LOGIN_TIMEOUT_SECONDS, allow_manual_login=not headless)
+        wait_for_login(
+            driver,
+            profile,
+            LOGIN_TIMEOUT_SECONDS,
+            allow_manual_login=not headless,
+        )
         driver.get(COMPOSE_URL)
         textbox = wait_clickable(
             driver,
@@ -382,6 +1130,7 @@ def post_text(profile: str, text: str, keep_open: bool, headless: bool) -> None:
 
 def show_profile(profile: str) -> None:
     meta = load_meta(profile) or {}
+    session = meta.get("session") if isinstance(meta.get("session"), dict) else {}
     root = profile_root(profile)
     browser = profile_browser_path(profile)
     summary = {
@@ -390,7 +1139,11 @@ def show_profile(profile: str) -> None:
         "browser_dir": str(browser),
         "has_cached_session": browser.exists(),
         "has_cached_meta": bool(meta),
+        "has_stored_session": bool(session.get("cookies")),
         "last_action": meta.get("last_action"),
+        "session_cookie_count": len(session.get("cookies", [])),
+        "session_captured_at": session.get("captured_at"),
+        "session_source": session.get("source"),
         "updated_at": meta.get("updated_at"),
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
@@ -409,7 +1162,7 @@ def list_profiles() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="xit",
-        description="Use a persistent Firefox profile per X account and post through the web UI.",
+        description="Use a persistent Firefox profile or imported X session and post through the web UI.",
     )
     parser.add_argument("profile", nargs="?", help="profile label, usually the X username")
     parser.add_argument("--post", dest="post_text_value", help="publish a post through the X web UI")
@@ -421,7 +1174,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="reuse a cached session in headless Firefox; not supported for auth",
+        help="reuse a cached Firefox or imported session in headless Firefox",
     )
     return parser
 
@@ -449,12 +1202,45 @@ def main(argv: list[str]) -> int:
         return 0
 
     if argv and argv[0] == "auth":
-        parser = argparse.ArgumentParser(prog="xit auth", description="open X login and cache the browser session")
+        parser = argparse.ArgumentParser(
+            prog="xit auth",
+            description="capture an X session via localhost and cache it for reuse",
+        )
         parser.add_argument("profile")
         parser.add_argument("--keep-open", action="store_true")
         parser.add_argument("--headless", action="store_true")
+        parser.add_argument(
+            "--manual-browser",
+            action="store_true",
+            help="use the old visible-browser auth flow instead of the localhost capture server",
+        )
+        parser.add_argument(
+            "--bind",
+            default=AUTH_CAPTURE_HOST,
+            help=f"bind host for the localhost auth page (default: {AUTH_CAPTURE_HOST})",
+        )
+        parser.add_argument(
+            "--port",
+            type=int,
+            default=AUTH_CAPTURE_PORT,
+            help=f"bind port for the localhost auth page (default: {AUTH_CAPTURE_PORT})",
+        )
+        parser.add_argument(
+            "--timeout",
+            type=int,
+            default=AUTH_CAPTURE_TIMEOUT_SECONDS,
+            help=f"seconds to wait for the localhost auth submission (default: {AUTH_CAPTURE_TIMEOUT_SECONDS})",
+        )
         args = parser.parse_args(argv[1:])
-        ensure_session(args.profile, keep_open=args.keep_open, headless=args.headless)
+        ensure_session(
+            args.profile,
+            keep_open=args.keep_open,
+            headless=args.headless,
+            manual_browser=args.manual_browser,
+            auth_bind=args.bind,
+            auth_port=args.port,
+            auth_timeout=args.timeout,
+        )
         return 0
 
     parser = build_parser()
